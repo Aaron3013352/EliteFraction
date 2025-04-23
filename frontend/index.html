@@ -16,12 +16,13 @@
 
   <p>Price per Share: 0.01 ETH</p>
   <input id="shareInput" type="number" placeholder="Enter number of shares" disabled />
-  <button onclick="buyShares()" disabled>Buy Shares</button>
+  <button id="buyBtn" onclick="buyShares()" disabled>Buy Shares</button>
 
   <label>Start Date:</label>
   <input type="date" id="startDate" required disabled />
   <label>End Date:</label>
   <input type="date" id="endDate" required disabled />
+  <button id="checkBtn" onclick="checkDates()" disabled>Check Dates</button>
 
   <h3>Your Share Balance</h3>
   <p id="myShares">-</p>
@@ -34,8 +35,8 @@
   <script src="https://cdn.jsdelivr.net/npm/ethers@5.7.2/dist/ethers.umd.min.js"></script>
   <script src="abi.js"></script>
   <script>
-    const contractAddress = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
     const socket = io("http://localhost:3000");
+    const contractAddress = "0x5fbdb2315678afecb367f032d93f642f64180aa3";
 
     let provider, signer, contract, userAddress;
     let bookingInProgress = false;
@@ -50,9 +51,6 @@
       document.getElementById("wallet").innerText = "Connected: " + userAddress;
       updateBalance();
       updateMyShares();
-
-      // ✅ NEW: Check backend status
-      socket.emit("checkBookingStatus", { address: userAddress });
     }
 
     async function updateBalance() {
@@ -62,34 +60,39 @@
     }
 
     async function updateMyShares() {
-      if (!contract) return;
       const myShares = await contract.getMyShares();
       document.getElementById("myShares").innerText = myShares.toString();
     }
 
     function initiateBooking() {
       if (bookingInProgress) {
-        alert("Another user is currently completing a purchase. Please try again shortly.");
+        alert("Another user is currently booking. Please try again.");
         return;
       }
 
       socket.emit("initiateBooking", { address: userAddress });
 
-      document.getElementById("shareInput").disabled = false;
       document.getElementById("startDate").disabled = false;
       document.getElementById("endDate").disabled = false;
-      document.querySelector("button[onclick='buyShares()']").disabled = false;
+      document.getElementById("checkBtn").disabled = false;
+    }
+
+    function checkDates() {
+      const startDate = document.getElementById("startDate").value;
+      const endDate = document.getElementById("endDate").value;
+
+      if (!startDate || !endDate) {
+        alert("Select valid dates first.");
+        return;
+      }
+
+      socket.emit("checkDates", { address: userAddress, startDate, endDate });
     }
 
     async function buyShares() {
       const amount = parseInt(document.getElementById("shareInput").value);
       const startDate = document.getElementById("startDate").value;
       const endDate = document.getElementById("endDate").value;
-
-      if (!startDate || !endDate) {
-        alert("Please select both start and end dates.");
-        return;
-      }
 
       if (!amount || isNaN(amount) || amount <= 0) {
         alert("Enter a valid number of shares");
@@ -99,14 +102,18 @@
       const pricePerShare = ethers.utils.parseEther("0.01");
       const totalCost = pricePerShare.mul(amount);
 
-      const tx = await contract.buyShare(amount, { value: totalCost });
-      await tx.wait();
+      try {
+        const tx = await contract.buyShare(amount, { value: totalCost });
+        await tx.wait();
 
-      socket.emit("reserveDates", { address: userAddress, startDate, endDate });
-      socket.emit("unlockDates", { address: userAddress });
+        socket.emit("reserveDates", { address: userAddress, startDate, endDate });
+        socket.emit("unlockDates", { address: userAddress });
 
-      updateMyShares();
-      updateBalance();
+        updateMyShares();
+        updateBalance();
+      } catch (e) {
+        socket.emit("unlockDates", { address: userAddress });
+      }
     }
 
     function displayProgress(data) {
@@ -117,84 +124,49 @@
 
       const buyersList = document.getElementById("buyers");
       buyersList.innerHTML = "";
-      if (data.buyers) {
-        data.buyers.forEach(b => {
-          const li = document.createElement("li");
-          li.innerText = `${b.address} — ${b.shares} shares`;
-          buyersList.appendChild(li);
-        });
-      }
+      data.buyers?.forEach(b => {
+        const li = document.createElement("li");
+        li.innerText = `${b.address} — ${b.shares} shares (${b.startDate || '-'} to ${b.endDate || '-'})`;
+        buyersList.appendChild(li);
+      });
     }
 
-    async function fetchProgress() {
-      const res = await fetch("http://localhost:3000/shares");
-      const data = await res.json();
-      displayProgress(data);
-    }
-
-    async function fetchBookings() {
-      const res = await fetch("http://localhost:3000/bookings");
-      const bookings = await res.json();
-      bookings.forEach(({ startDate, endDate }) => disableDateRange(startDate, endDate));
-    }
-
-    function disableDateRange(start, end) {
-      document.getElementById("startDate").setCustomValidity("Some dates are booked.");
-      document.getElementById("endDate").setCustomValidity("Some dates are booked.");
-      document.getElementById("startDate").disabled = true;
-      document.getElementById("endDate").disabled = true;
-      document.querySelector("button[onclick='buyShares()']").disabled = true;
+    function resetUI() {
+      const inputs = ["shareInput", "startDate", "endDate"];
+      inputs.forEach(id => {
+        document.getElementById(id).disabled = true;
+        document.getElementById(id).value = "";
+      });
+      document.getElementById("buyBtn").disabled = true;
+      document.getElementById("checkBtn").disabled = true;
+      document.getElementById("initiateBtn").disabled = false;
     }
 
     socket.on("updateShares", displayProgress);
 
-    socket.on("lockInitiateBtn", ({ address }) => {
+    socket.on("lockBookingUI", ({ address }) => {
       if (address !== userAddress) {
         document.getElementById("initiateBtn").disabled = true;
       }
     });
 
-    socket.on("lockDates", ({ address, startDate, endDate }) => {
-      if (address !== userAddress) {
-        document.getElementById("startDate").disabled = true;
-        document.getElementById("endDate").disabled = true;
-        document.querySelector("button[onclick='buyShares()']").disabled = true;
-        document.getElementById("initiateBtn").disabled = true;
-        alert("Another user is currently booking this product.");
-      } else {
-        bookingInProgress = true;
-      }
-    });
+    socket.on("unlockUI", () => resetUI());
 
-    socket.on("unlockUI", ({ address }) => {
-      const startInput = document.getElementById("startDate");
-      const endInput = document.getElementById("endDate");
-      const buyButton = document.querySelector("button[onclick='buyShares()']");
-      const bookBtn = document.getElementById("initiateBtn");
-      const shareInput = document.getElementById("shareInput");
+    socket.on("bookingRejected", ({ message }) => alert(message));
 
-      bookBtn.disabled = false;
-      shareInput.disabled = true;
-      startInput.disabled = true;
-      endInput.disabled = true;
-      buyButton.disabled = true;
-
-      shareInput.value = "";
-      startInput.value = "";
-      endInput.value = "";
-
-      startInput.setCustomValidity("");
-      endInput.setCustomValidity("");
-
-      bookingInProgress = false;
-    });
-
-    socket.on("bookingRejected", ({ message }) => {
+    socket.on("bookingConflict", ({ message }) => {
       alert(message);
+      resetUI();
     });
 
-    fetchProgress();
-    fetchBookings();
+    socket.on("datesAvailable", () => {
+      document.getElementById("shareInput").disabled = false;
+      document.getElementById("buyBtn").disabled = false;
+    });
+
+    fetch("http://localhost:3000/shares")
+      .then(res => res.json())
+      .then(displayProgress);
   </script>
 </body>
 </html>
