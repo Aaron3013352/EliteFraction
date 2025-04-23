@@ -1,53 +1,61 @@
-// backend.js
 const express = require("express");
-const { Server } = require("socket.io");
 const http = require("http");
+const { Server } = require("socket.io");
 const mongoose = require("mongoose");
-const { ethers } = require("ethers");
 const cors = require("cors");
+const { ethers } = require("ethers");
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
 
 app.use(cors());
-
 mongoose.connect("mongodb://localhost:27017/elitefraction");
 
 const ShareSchema = new mongoose.Schema({
-  totalSold: Number,
   address: String,
   shares: Number,
+  startDate: String,
+  endDate: String,
 });
-
 const BookingSchema = new mongoose.Schema({
   address: String,
   startDate: String,
   endDate: String,
 });
 
-const Booking = mongoose.model("Booking", BookingSchema);
 const Share = mongoose.model("Share", ShareSchema);
+const Booking = mongoose.model("Booking", BookingSchema);
 
 let bookingInProgress = false;
 let currentBookingAddress = null;
 
-const ABI = require("./abi.json");
+// ✅ Contract Setup
+const ABI = require("./abi.json"); // make sure abi.json exists in same directory
 const provider = new ethers.providers.JsonRpcProvider("http://127.0.0.1:8545");
 const contract = new ethers.Contract("0x5fbdb2315678afecb367f032d93f642f64180aa3", ABI, provider);
 
+// ✅ Listen for SharePurchased events
 contract.on("SharePurchased", async (buyer, amount) => {
-  console.log(`🔥 Event: ${buyer} bought ${amount} shares`);
-  const existing = await Share.findOne({ address: buyer });
-  if (existing) {
-    existing.shares += amount.toNumber();
-    await existing.save();
-  } else {
-    await Share.create({ address: buyer, shares: amount.toNumber() });
+  console.log(`🔥 Event received: ${buyer} bought ${amount} shares`);
+
+  try {
+    const existing = await Share.findOne({ address: buyer });
+
+    if (existing) {
+      existing.shares += amount.toNumber();
+      await existing.save();
+    } else {
+      await Share.create({ address: buyer, shares: amount.toNumber() });
+    }
+
+    const all = await Share.find();
+    const totalSold = all.reduce((sum, doc) => sum + doc.shares, 0);
+    io.emit("updateShares", { totalSold, buyers: all });
+
+  } catch (err) {
+    console.error("❌ Failed to process SharePurchased event:", err);
   }
-  const all = await Share.find();
-  const totalSold = all.reduce((sum, doc) => sum + doc.shares, 0);
-  io.emit("updateShares", { totalSold, buyers: all });
 });
 
 io.on("connection", (socket) => {
@@ -58,36 +66,45 @@ io.on("connection", (socket) => {
       bookingInProgress = true;
       currentBookingAddress = address;
       io.emit("lockBookingUI", { address });
-      io.emit("lockInitiateBtn", { address });
     }
+  });
+
+  socket.on("checkDates", async ({ address, startDate, endDate }) => {
+    const conflict = await Booking.findOne({
+      $or: [
+        { startDate: { $lte: endDate }, endDate: { $gte: startDate } }
+      ]
+    });
+
+    if (conflict) {
+      socket.emit("bookingConflict", {
+        message: "Selected dates overlap. Please choose different dates.",
+      });
+      return;
+    }
+
+    io.to(socket.id).emit("datesAvailable");
   });
 
   socket.on("reserveDates", async ({ address, startDate, endDate }) => {
     await Booking.create({ address, startDate, endDate });
-    console.log("✅ Booking saved:", address, startDate, endDate);
+
+    const existing = await Share.findOne({ address });
+    if (existing) {
+      existing.startDate = startDate;
+      existing.endDate = endDate;
+      await existing.save();
+    }
+
+    const all = await Share.find();
+    const totalSold = all.reduce((sum, doc) => sum + doc.shares, 0);
+    io.emit("updateShares", { totalSold, buyers: all });
   });
 
   socket.on("unlockDates", ({ address }) => {
     bookingInProgress = false;
     currentBookingAddress = null;
     io.emit("unlockUI", { address });
-  });
-
-  socket.on("checkBookingStatus", ({ address }) => {
-    if (bookingInProgress && currentBookingAddress !== address) {
-      socket.emit("bookingRejected", { message: "Another user is currently booking. Please wait." });
-    } else {
-      socket.emit("unlockUI", { address });
-    }
-  });
-
-  socket.on("disconnect", () => {
-    if (bookingInProgress) {
-      console.log("⚠️ User disconnected. Unlocking booking.");
-      bookingInProgress = false;
-      currentBookingAddress = null;
-      io.emit("unlockUI", { address: "DISCONNECTED_USER" });
-    }
   });
 });
 
@@ -97,15 +114,4 @@ app.get("/shares", async (req, res) => {
   res.json({ totalSold, buyers: all });
 });
 
-app.get("/bookings", async (req, res) => {
-  const bookings = await Booking.find({});
-  res.json(bookings);
-});
-
-app.get("/status", (req, res) => {
-  res.json({ bookingInProgress });
-});
-
-server.listen(3000, () => {
-  console.log("✅ Server running on http://localhost:3000");
-});
+server.listen(3000, () => console.log("Server running on http://localhost:3000"));
